@@ -35,6 +35,10 @@ pub struct HistogramEntry {
 pub struct Histogram {
     gamma: Option<f64>,
     fixed_colors: FixedColorsSet,
+    /// Set once any fully transparent pixel is seen, so that a clean (RGB=0)
+    /// transparent entry is guaranteed in the palette even though such pixels
+    /// are excluded from color statistics.
+    has_fully_transparent_pixels: bool,
 
     /// The key is the RGBA cast to u32
     /// The value is a (boosted) count or 0 if it's a fixed color
@@ -95,6 +99,7 @@ impl Histogram {
             posterize_bits: attr.posterize_bits(),
             max_histogram_entries: attr.max_histogram_entries,
             fixed_colors: HashSet::with_hasher(U32Hasher(0)),
+            has_fully_transparent_pixels: false,
             hashmap: HashMap::with_hasher(U32Hasher(0)),
             gamma: None,
         }
@@ -191,6 +196,21 @@ impl Histogram {
 
     #[inline(never)]
     pub(crate) fn quantize_internal(&mut self, attr: &Attributes, freeze_result_colors: bool) -> Result<QuantizationResult, Error> {
+        // Fully transparent pixels were excluded from statistics, but remapping
+        // still needs an exact transparent color to map them to. Add the single
+        // canonical (0,0,0,0) color as a fixed palette entry before the empty
+        // check, so an all-transparent image still quantizes to one zero color.
+        let transparent = RGBA::new(0, 0, 0, 0);
+        if self.has_fully_transparent_pixels
+            && self.fixed_colors.len() < MAX_COLORS
+            && !self.fixed_colors.iter().any(|c| c.rgba == transparent)
+        {
+            self.fixed_colors.insert(HashColor {
+                rgba: transparent,
+                index: self.fixed_colors.len() as _,
+            });
+        }
+
         if self.hashmap.is_empty() && self.fixed_colors.is_empty() {
             return Err(Unsupported);
         }
@@ -214,9 +234,20 @@ impl Histogram {
             return;
         }
 
-        let px_int = if rgba.a != 0 {
+        if rgba.a == 0 {
+            // Fully transparent pixels carry no meaningful color: their RGB is
+            // unassociated ("dirty") garbage in typical PNGs. They must not take
+            // part in color statistics (median cut/k-means), otherwise the
+            // garbage RGB pollutes the palette and causes fringe noise around
+            // transparent edges. Remember their presence instead and reserve a
+            // single clean transparent color in `quantize_internal`.
+            self.has_fully_transparent_pixels = true;
+            return;
+        }
+
+        let px_int = {
             self.posterize_mask() & unsafe { RGBAInt { rgba }.int }
-        } else { 0 };
+        };
 
         self.hashmap.entry(px_int)
             // it can overflow on images over 2^24 pixels large
@@ -432,4 +463,144 @@ impl Hash for HashColor {
 }
 
 impl Eq for HashColor {
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{new, RGBA};
+
+    fn quantize(pixels: &[RGBA], w: usize, h: usize, max_colors: usize, dither: f32) -> (Vec<RGBA>, Vec<u8>) {
+        let mut attr = new();
+        attr.set_max_colors(max_colors as u32).unwrap();
+        attr.set_quality(0, 100).unwrap();
+        let mut img = attr.new_image_borrowed(pixels, w, h, 0.).unwrap();
+        let mut res = attr.quantize(&mut img).unwrap();
+        res.set_dithering_level(dither).unwrap();
+        res.remapped(&mut img).unwrap()
+    }
+
+    #[test]
+    fn transparent_pixels_excluded_and_decoded_zero() {
+        // Background is fully transparent but carries deliberately dirty RGB.
+        let dirty = [
+            RGBA::new(255, 0, 255, 0),
+            RGBA::new(0, 255, 0, 0),
+            RGBA::new(255, 255, 0, 0),
+        ];
+        let mut pixels = Vec::new();
+        for i in 0..(16 * 16) {
+            pixels.push(dirty[i % 3]);
+        }
+        // A small opaque block so the image is not entirely transparent.
+        for y in 6..10 {
+            for x in 6..10 {
+                pixels[y * 16 + x] = RGBA::new(200, 30, 30, 255);
+            }
+        }
+
+        for dither in [0., 1.] {
+            let (palette, indices) = quantize(&pixels, 16, 16, 8, dither);
+
+            // Exactly one fully transparent palette entry, and it is zero RGB.
+            let transparent: Vec<_> = palette.iter().filter(|c| c.a == 0).collect();
+            assert_eq!(transparent.len(), 1, "palette={palette:?}");
+            assert_eq!(*transparent[0], RGBA::new(0, 0, 0, 0), "palette={palette:?}");
+
+            // Every fully transparent input pixel decodes to (0,0,0,0).
+            for (src, &idx) in pixels.iter().zip(indices.iter()) {
+                let out = palette[usize::from(idx)];
+                if src.a == 0 {
+                    assert_eq!(out, RGBA::new(0, 0, 0, 0), "dither={dither}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dirty_transparent_rgb_never_enters_palette() {
+        // Transparent pixels outnumber the single opaque color by a wide margin.
+        // If their RGB were counted, the palette would be dominated by the
+        // garbage colors instead of faithfully representing the opaque block.
+        let mut pixels = vec![RGBA::new(12, 200, 240, 0); 32 * 32];
+        for px in pixels.iter_mut().take(64) {
+            *px = RGBA::new(17, 17, 17, 255);
+        }
+        let (palette, _) = quantize(&pixels, 32, 32, 4, 0.);
+
+        assert!(palette.contains(&RGBA::new(0, 0, 0, 0)), "palette={palette:?}");
+        assert!(palette.contains(&RGBA::new(17, 17, 17, 255)), "palette={palette:?}");
+        // No opaque/semi-opaque entry may inherit the dirty cyan RGB.
+        for c in &palette {
+            if c.a != 0 {
+                assert_ne!((c.r, c.g, c.b), (12, 200, 240), "dirty RGB leaked: {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn all_transparent_image_is_zero() {
+        let pixels = vec![RGBA::new(99, 155, 201, 0); 8 * 8];
+        for dither in [0., 1.] {
+            let (palette, indices) = quantize(&pixels, 8, 8, 4, dither);
+            assert_eq!(palette.len(), 1, "palette={palette:?}");
+            assert_eq!(palette[0], RGBA::new(0, 0, 0, 0));
+            assert!(indices.iter().all(|&i| palette[usize::from(i)] == RGBA::new(0, 0, 0, 0)), "dither={dither}");
+        }
+    }
+
+    #[test]
+    fn multi_image_histogram_transparent_is_zero() {
+        use crate::Histogram;
+
+        let attr = new();
+        let mut hist = Histogram::new(&attr);
+
+        // First image: dirty transparent background + opaque blue block.
+        let mut img1 = vec![RGBA::new(10, 200, 30, 0); 16];
+        for px in img1.iter_mut().take(4) {
+            *px = RGBA::new(30, 60, 220, 255);
+        }
+        let mut image1 = attr.new_image_borrowed(&img1, 4, 4, 0.).unwrap();
+        hist.add_image(&attr, &mut image1).unwrap();
+
+        // Second image: different dirty transparent RGB + opaque red block.
+        let mut img2 = vec![RGBA::new(240, 12, 200, 0); 16];
+        for px in img2.iter_mut().take(4) {
+            *px = RGBA::new(220, 40, 40, 255);
+        }
+        let mut image2 = attr.new_image_borrowed(&img2, 4, 4, 0.).unwrap();
+        hist.add_image(&attr, &mut image2).unwrap();
+
+        let mut res = hist.quantize(&attr).unwrap();
+        let palette = res.palette();
+
+        let transparent: Vec<_> = palette.iter().copied().filter(|c| c.a == 0).collect();
+        assert_eq!(transparent.len(), 1, "palette={palette:?}");
+        assert_eq!(transparent[0], RGBA::new(0, 0, 0, 0));
+        // Neither image's dirty transparent RGB may appear as an opaque entry.
+        for c in palette {
+            if c.a != 0 {
+                assert_ne!((c.r, c.g, c.b), (10, 200, 30), "leak: {c:?}");
+                assert_ne!((c.r, c.g, c.b), (240, 12, 200), "leak: {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn full_fixed_palette_plus_transparent_does_not_overflow() {
+        // 256 user fixed colors already fill the palette. The implicit
+        // transparent entry must be skipped, not overflow MAX_COLORS.
+        let attr = new();
+        let pixels = vec![RGBA::new(123, 45, 67, 0); 4];
+        let mut img = attr.new_image_borrowed(&pixels, 2, 2, 0.).unwrap();
+        for i in 0..256u16 {
+            let v = (i % 256) as u8;
+            img.add_fixed_color(RGBA::new(v, v.wrapping_add(7), v.wrapping_add(13), 255)).unwrap();
+        }
+        let mut res = attr.quantize(&mut img).unwrap();
+        let (palette, indices) = res.remapped(&mut img).unwrap();
+        assert_eq!(palette.len(), 256);
+        // Image pixels still remap without error and stay within the palette.
+        assert!(indices.iter().all(|&i| usize::from(i) < palette.len()));
+    }
 }

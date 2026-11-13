@@ -349,15 +349,14 @@ impl PalF {
     /// Also rounds the input pal
     pub(crate) fn init_int_palette(&mut self, int_palette: &mut Palette, gamma: f64, posterize: u8) {
         let lut = gamma_lut(gamma);
-        for ((f_color, f_pop), int_pal) in self.iter_mut().zip(&mut int_palette.entries) {
-            let mut px = f_color.to_rgb(gamma)
+        for ((f_color, _f_pop), int_pal) in self.iter_mut().zip(&mut int_palette.entries) {
+            let px = f_color.to_rgb(gamma)
                 .map(move |c| posterize_channel(c, posterize));
             *f_color = f_pixel::from_rgba(&lut, px);
-            if px.a == 0 && !f_pop.is_fixed() {
-                px.r = 71u8;
-                px.g = 112u8;
-                px.b = 76u8;
-            }
+            // Fully transparent entries always keep RGB = 0. `to_rgb` already
+            // returns (0,0,0,0) for them, and fully transparent pixels are
+            // excluded from statistics and represented by a fixed zero color,
+            // so no "dirty" RGB can reach the output palette here.
             *int_pal = px;
         }
         int_palette.count = self.len() as _;
