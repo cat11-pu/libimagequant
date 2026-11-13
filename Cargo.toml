@@ -53,7 +53,7 @@ hashbrown = { version = "0.15.4", optional = true, default-features = false }
 lodepng = "3.10"
 
 [workspace]
-members = ["imagequant-sys", "imagequant-sys/c_test"]
+members = ["imagequant-sys", "imagequant-sys/c_test", "tools/palette-map"]
 
 [package.metadata.release]
 consolidate-commits = true

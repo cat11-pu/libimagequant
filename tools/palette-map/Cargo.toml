@@ -1,0 +1,19 @@
+[package]
+name = "palette-map"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "palette_map"
+path = "src/lib.rs"
+
+[[bin]]
+name = "palette-map"
+path = "src/main.rs"
+
+[dependencies]
+lodepng = "3.10"
+
+[dev-dependencies]
+imagequant = { path = "../.." }
